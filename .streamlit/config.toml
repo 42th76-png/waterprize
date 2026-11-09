@@ -1,0 +1,8 @@
+[server]
+# Hugging Face 는 앱을 다른 사이트 안(iframe)에 띄워서, 이 보호 기능이 켜져 있으면 사진 업로드가 막힘
+enableXsrfProtection = false
+enableCORS = false
+maxUploadSize = 50
+
+[browser]
+gatherUsageStats = false
