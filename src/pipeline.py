@@ -6,6 +6,8 @@ Streamlit 화면(src/app.py)과 다른 코드에서 함께 쓰는 분석 단계 
       · 보통: fold 모델 13개가 각자 찾은 상자를 모아 과반수(7개 이상)가 찾으면 '스팟 있음', 상자는 중앙값
       · 데모 모드(데이터셋 시료 k 의 사진): 시료 k 를 본 적 없는 fold k 모델만 사용
   - 물질 판별: 교차검증에서 가장 좋았던 'ResNet-50 특징 + 랜덤포레스트, 스팟 A만' (LOSO 8/13)
+      · A 스팟이 없으면 이 판별은 사진과 무관한 고정값 → 화면에서 경고하고 A~D 판별(LOSO 평균 7.4/13)을 참고로 함께 보여 줌
+      · 학습 사진과의 코사인 유사도가 채널별 LOSO 기준선보다 낮으면 '처음 보는 패턴' 경고
   - Grad-CAM: 같은 ResNet-50 특징(A~D) 위의 설명용 로지스틱 회귀 판정층 (gradcam_spots.py 와 같은 방식)
   - TU: toxic_unit.py 의 문헌 EC50 과 저/중/고 기준. 농도는 사용자가 입력 (모델은 농도를 예측하지 않음)
   - 데모 모드에서는 판별·Grad-CAM 모델도 시료 k 를 빼고 학습 → 처음 보는 사진처럼 정직하게 평가
@@ -177,12 +179,68 @@ class Analyzer:
                 y.append(CLASSES.index(chem))
         XA, X4, y = np.array(XA), np.array(X4), np.array(y)
         self.rf = RandomForestClassifier(n_estimators=500, random_state=seed, n_jobs=-1).fit(XA, y)
+        # 참고용 두 번째 판별: A~D 4장을 모두 쓰는 랜덤포레스트 (교차검증 13개 중 평균 7.4개 정답)
+        #  → A 스팟이 없어 위 판별이 '고정값'이 될 때도 사진에 따라 달라지는 결과를 함께 보여 주려고
+        self.rf4 = RandomForestClassifier(n_estimators=500, random_state=seed, n_jobs=-1).fit(X4, y)
+        # A 스팟이 없을 때 판별기가 내는 값 = 사진과 상관없이 늘 같은 값 (화면에서 경고용)
+        self.p_no_A = np.zeros(len(CLASSES))
+        self.p_no_A[self.rf.classes_] = self.rf.predict_proba(np.zeros((1, DIM)))[0]
+        self._build_similarity(vec, exclude_sample)
         self.scaler = StandardScaler().fit(X4)
         self.logit = LogisticRegression(C=1.0, max_iter=5000).fit(self.scaler.transform(X4), y)
         W = np.zeros((len(CLASSES), X4.shape[1]), np.float32)
         W[self.logit.classes_] = self.logit.coef_ / self.scaler.scale_
         self.W = W - W[self.logit.classes_].mean(axis=0)
         self.exclude_sample = exclude_sample
+
+    def _build_similarity(self, vec, exclude_sample):
+        """'학습한 사진과 얼마나 닮았나' 를 재기 위한 준비.
+        채널마다 스팟이 있는 학습 사진의 ResNet 특징을 길이 1로 맞춰 저장 (코사인 유사도용).
+        기준선: 시료 하나를 빼고, 그 시료 원본 사진이 남은 시료들과 가장 닮은 정도(LOSO)를 13번 잼.
+                실제 학습 시료끼리도 이 정도는 다르다는 뜻 → 새 사진이 이보다 덜 닮으면 '처음 보는 패턴'"""
+        self.ref = {}
+        for c in CHANNELS:
+            names, feats = [], []
+            for s in SAMPLES:
+                if s == exclude_sample:
+                    continue
+                for a in range(1, 21):
+                    v = vec[f'{c}{s}-{a}']
+                    if v[0] == 1:  # 스팟이 있는 사진만
+                        names.append(s)
+                        feats.append(v[1:] / (np.linalg.norm(v[1:]) + 1e-9))
+            self.ref[c] = (np.array(names), np.array(feats, np.float32))
+        self.sim_baseline = {}  # 채널별: 학습 시료끼리 가장 덜 닮았던 값 (채널마다 패턴이 달라 따로 잼)
+        for c in CHANNELS:
+            names, feats = self.ref[c]
+            sims = []
+            for s in SAMPLES:
+                v = vec[f'{c}{s}-1']
+                if v[0] != 1 or s == exclude_sample or not (names != s).any():
+                    continue
+                u = v[1:] / (np.linalg.norm(v[1:]) + 1e-9)
+                sims.append(float((feats[names != s] @ u).max()))
+            self.sim_baseline[c] = float(np.min(sims)) if sims else 0.0
+
+    def similarity(self, feats):
+        """새 사진 특징 → 채널별 '가장 닮은 학습 사진' 유사도, 학습 시료별 평균 유사도 순위.
+        유사도는 코사인(1 = 똑같음). 스팟이 없는 채널은 빼고 계산"""
+        per_ch, per_sample = {}, {}
+        for c in CHANNELS:
+            f = feats[c]
+            if f[0] != 1:
+                continue
+            u = f[1:] / (np.linalg.norm(f[1:]) + 1e-9)
+            names, ref = self.ref[c]
+            sim = ref @ u
+            per_ch[c] = float(sim.max())
+            for s in set(names.tolist()):
+                per_sample.setdefault(s, []).append(float(sim[names == s].max()))
+        rank = sorted(((float(np.mean(v)), s) for s, v in per_sample.items()), reverse=True)
+        # 한 채널이라도 기준선보다 덜 닮았으면 '처음 보는 패턴'
+        odd = [c for c, v in per_ch.items() if v < self.sim_baseline[c]]
+        return {'per_channel': per_ch, 'top': [(s, v) for v, s in rank[:3]],
+                'baseline': self.sim_baseline, 'odd_channels': odd, 'unfamiliar': bool(odd)}
 
     def _tensor(self, crop):
         rgb = cv2.cvtColor(cv2.resize(crop, (224, 224), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2RGB)
@@ -203,7 +261,9 @@ class Analyzer:
         x4 = np.concatenate([feats[c] for c in CHANNELS])[None]
         p_lr = np.zeros(len(CLASSES))
         p_lr[self.logit.classes_] = self.logit.predict_proba(self.scaler.transform(x4))[0]
-        return p_rf, p_lr
+        p_rf4 = np.zeros(len(CLASSES))
+        p_rf4[self.rf4.classes_] = self.rf4.predict_proba(x4)[0]
+        return p_rf, p_lr, p_rf4
 
     def gradcam(self, crop, channel, class_idx, alpha=0.45):
         """잘라낸 스팟 위에 class_idx 쪽으로 판단을 끌어당긴 부분을 히트맵으로 겹침"""
@@ -237,9 +297,12 @@ def run_pipeline(images, conc_mg_L, analyzer, detectors, do_topview=True, conf=0
         feats[ch] = analyzer.feature(crop)
         res['channels'][ch] = {'topview': tv, 'topview_how': how, 'det': det, 'boxed': draw_box(tv, det),
                                'crop': crop, 'features': hand}
-    p_rf, p_lr = analyzer.classify(feats)
+    p_rf, p_lr, p_rf4 = analyzer.classify(feats)
     pred = int(p_rf.argmax())
-    res['proba'], res['proba_explainer'] = p_rf, p_lr
+    res['proba'], res['proba_explainer'], res['proba_4ch'] = p_rf, p_lr, p_rf4
+    res['a_missing'] = not res['channels']['A']['det']['detected']  # True 면 res['proba'] 는 고정값
+    res['proba_no_A'] = analyzer.p_no_A
+    res['similarity'] = analyzer.similarity(feats)
     res['pred'] = CLASSES[pred]
     res['tu'] = assess(CLASSES[pred], conc_mg_L)
     for ch in CHANNELS:

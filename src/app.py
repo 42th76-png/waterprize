@@ -61,6 +61,8 @@ with st.sidebar:
     st.markdown('**사용하는 모델** (앞 단계 결정 그대로)\n'
                 '- 스팟 탐지: LOSO fold 모델 13개의 과반수 투표\n'
                 '- 판별: ResNet-50 특징 + 랜덤포레스트, 스팟 A만 (교차검증 13개 중 8개 정답)\n'
+                '- 참고 판별: 같은 방식, 스팟 A~D (교차검증 평균 7.4개)\n'
+                '- 닮은 정도: 학습 사진과의 코사인 유사도 (처음 보는 패턴 경고)\n'
                 '- Grad-CAM: 설명용 로지스틱 회귀 판정층 (A~D)\n'
                 '- TU: 문헌 EC50 (Cu 0.521, NaCl 4,770, SDS 5.5 mg/L)')
 
@@ -98,6 +100,10 @@ default_conc = float(P.SAMPLES[known][1]) if known else 1.0
 conc = st.number_input('시료 농도 (mg/L) — TU 계산용, 모델은 농도를 예측하지 않습니다',
                        min_value=0.0, value=default_conc, step=1.0, format='%g')
 
+# 지금 올린 사진 묶음의 '지문' (사진을 바꾸면 달라짐) → 예전 결과가 새 사진 결과처럼 보이지 않게
+input_sig = (('example', example) if example else
+             tuple((ch, getattr(f, 'file_id', None) or f.name, f.size) if f else None for ch, f in files.items()))
+
 ready = bool(example) or all(files.values())
 if not ready:
     st.info('A~D 사진 4장을 모두 올리거나, 예시 사진을 고르면 분석을 시작할 수 있습니다.')
@@ -116,9 +122,13 @@ if st.button('분석 시작', type='primary', disabled=not ready):
     with st.spinner('분석 중...'):
         st.session_state['res'] = P.run_pipeline(images, conc, analyzer, detectors, use_topview, conf,
                                                  camera_angle_deg=angle, hfov_deg=fov)
-        st.session_state['res_meta'] = {'demo': demo, 'known': known}
+        st.session_state['res_meta'] = {'demo': demo, 'known': known, 'sig': input_sig}
 
 res = st.session_state.get('res')
+if res and st.session_state['res_meta'].get('sig') != input_sig:
+    # 사진을 바꿨는데 '분석 시작'을 다시 누르지 않은 상태 → 이전 사진의 결과는 숨김
+    st.warning('사진이 바뀌었습니다. 아래 결과는 이전 사진의 것이라 숨겼어요. **분석 시작**을 다시 눌러 주세요.')
+    res = None
 if res:
     meta = st.session_state['res_meta']
     if meta['demo']:
@@ -145,10 +155,10 @@ if res:
     for ch in P.CHANNELS:
         f = res['channels'][ch]['features']
         table.append({'채널': f'{ch} {P.CHANNEL_NAME[ch]}',
-                      '침착 지름 (px)': f['diameter_px'] if f else '-',
-                      '고리 세기': f['ring_strength'] if f else '-',
-                      '잔류물 면적 (px²)': f['residue_area_px'] if f else '-',
-                      '결정 개수': f['crystal_count'] if f else '-'})
+                      '침착 지름 (px)': f['diameter_px'] if f else None,  # 빈칸 = 스팟 없음
+                      '고리 세기': f['ring_strength'] if f else None,
+                      '잔류물 면적 (px²)': f['residue_area_px'] if f else None,
+                      '결정 개수': f['crystal_count'] if f else None})
     st.dataframe(table, hide_index=True, width='stretch')
 
     # ④ 판별 + ⑤ TU
@@ -160,6 +170,39 @@ if res:
             st.progress(float(res['proba'][k]), text=f'{CLASS_KO[cls]}: {res["proba"][k]:.2f}')
         st.caption('판별에는 A(증류수) 스팟만 사용합니다 (교차검증에서 가장 좋았던 방식, 13개 중 8개 정답). '
                    '대조군 시료가 1개뿐이라 대조군 판별은 특히 믿기 어렵습니다.')
+        if res.get('a_missing'):
+            st.warning('**A(증류수) 스팟을 찾지 못했습니다.** 이때 판별기는 사진 내용을 보지 않고 '
+                       "'A 스팟이 없던 학습 시료들'의 비율만으로 답하므로, 어떤 사진을 넣어도 항상 같은 값 "
+                       f"({' / '.join(f'{c} {v:.2f}' for c, v in zip(P.CLASSES, res['proba_no_A']))})이 나옵니다. "
+                       '학습 데이터에서 A 스팟이 없던 시료는 주로 Cu 였기 때문에 Cu 쪽으로 치우칩니다. '
+                       '아래 A~D 4장 판별을 함께 보세요.')
+        # 참고: A~D 4장 모두 쓰는 판별 (사진마다 달라짐)
+        p4 = res.get('proba_4ch')
+        if p4 is not None:
+            with st.expander(f"참고: A~D 4장을 모두 쓴 판별 → {CLASS_KO[P.CLASSES[int(p4.argmax())]]}",
+                             expanded=bool(res.get('a_missing'))):
+                for k, cls in enumerate(P.CLASSES):
+                    st.progress(float(p4[k]), text=f'{CLASS_KO[cls]}: {p4[k]:.2f}')
+                st.caption('교차검증 13개 중 평균 7.4개 정답 (A만 쓰는 위 판별보다 조금 낮음). '
+                           '두 판별이 같은 답이면 조금 더 믿을 만하고, 다르면 결과를 조심해서 보세요.')
+
+        # 학습 시료와 얼마나 닮았나: 모델은 4종 중 하나로만 답할 수 있으므로, 처음 보는 물질도 억지로 4종 중 하나가 됨
+        sim = res.get('similarity')
+        if sim and sim['per_channel']:
+            st.markdown('**학습한 사진과 얼마나 닮았나** (코사인 유사도, 1 = 똑같음)')
+            st.caption('  ·  '.join(f"{c} {v:.2f} (기준선 {sim['baseline'][c]:.2f})"
+                                    for c, v in sim['per_channel'].items())
+                       + '  — 기준선: 학습 시료끼리 가장 덜 닮았던 값')
+            st.caption('가장 닮은 학습 시료: ' + ', '.join(
+                f"시료 {s} {P.SAMPLE_NAME[s]} ({v:.2f})" for s, v in sim['top']))
+            if sim['unfamiliar']:
+                st.error(f"**처음 보는 패턴입니다** ({', '.join(sim['odd_channels'])} 채널). "
+                         '이 채널 사진은 학습한 13개 시료 어느 것과도 기준선보다 덜 닮았습니다. '
+                         '모델은 Ctrl·Cu·NaCl·SDS 네 가지 중 하나로만 답하도록 만들어졌기 때문에, '
+                         '학습하지 않은 물질이거나 촬영 조건(거리·각도·조명·배경)이 다르면 위 판별 결과는 믿기 어렵습니다.')
+        elif sim is not None:
+            st.error('**4장 모두에서 스팟을 찾지 못했습니다.** 판별 결과는 사진과 상관없는 고정값이니 쓰지 마세요. '
+                     '탑뷰 변환 설정(원본/이미 탑뷰)이 맞는지, 스팟이 사진 안에 잘 보이는지 확인해 주세요.')
     with right:
         st.subheader('⑤ 이론 TU 등급')
         tu = res['tu']
