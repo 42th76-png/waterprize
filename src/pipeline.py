@@ -5,8 +5,10 @@ Streamlit 화면(src/app.py)과 다른 코드에서 함께 쓰는 분석 단계 
   - 스팟 탐지: LOSO fold 모델(runs/spot/foldXX). 36 epoch 에서 멈춘 최종 모델은 쓰지 않음
       · 보통: fold 모델 13개가 각자 찾은 상자를 모아 과반수(7개 이상)가 찾으면 '스팟 있음', 상자는 중앙값
       · 데모 모드(데이터셋 시료 k 의 사진): 시료 k 를 본 적 없는 fold k 모델만 사용
-  - 물질 판별: 교차검증에서 가장 좋았던 'ResNet-50 특징 + 랜덤포레스트, 스팟 A만' (LOSO 8/13)
-      · A 스팟이 없으면 이 판별은 사진과 무관한 고정값 → 화면에서 경고하고 A~D 판별(LOSO 평균 7.4/13)을 참고로 함께 보여 줌
+  - 물질 판별: 'ResNet-50 특징 + 랜덤포레스트, 스팟 A~D 4장' (LOSO 5개 시드 평균 7.4/13)
+      · 4장을 모두 보므로 한 채널에서 스팟을 못 찾아도 다른 채널 사진에 따라 결과가 달라짐
+      · 답은 증류수(대조군)·Cu·NaCl·SDS 네 가지. 증류수 학습 시료가 1개뿐이라 증류수 판별은 검증이 어려움
+  - 탑뷰 변환: 'auto' 면 변환한 것/안 한 것 둘 다 탐지해 보고 스팟을 더 잘 찾는 쪽을 씀
       · 학습 사진과의 코사인 유사도가 채널별 LOSO 기준선보다 낮으면 '처음 보는 패턴' 경고
   - Grad-CAM: 같은 ResNet-50 특징(A~D) 위의 설명용 로지스틱 회귀 판정층 (gradcam_spots.py 와 같은 방식)
   - TU: toxic_unit.py 의 문헌 EC50 과 저/중/고 기준. 농도는 사용자가 입력 (모델은 농도를 예측하지 않음)
@@ -31,7 +33,7 @@ from toxic_unit import SAMPLES, assess  # noqa: E402
 CLASSES = ['Ctrl', 'Cu', 'NaCl', 'SDS']
 CHANNELS = 'ABCD'
 CHANNEL_NAME = {'A': '증류수', 'B': '탄닌', 'C': '셀룰로오스', 'D': '탄닌+셀룰로오스'}
-SAMPLE_NAME = {1: 'SDS10', 2: 'Cu1', 3: 'NaCl3000', 4: 'Ctrl', 5: 'Cu50', 6: 'SDS1', 7: 'NaCl100',
+SAMPLE_NAME = {1: 'SDS10', 2: 'Cu1', 3: 'NaCl3000', 4: '증류수', 5: 'Cu50', 6: 'SDS1', 7: 'NaCl100',
                8: 'Cu0.1', 9: 'SDS100', 10: 'NaCl10000', 11: 'Cu10', 12: 'SDS30', 13: 'NaCl1000'}
 RUNS = ROOT / 'runs' / 'spot'
 FEAT_CACHE = ROOT / 'data' / 'features' / 'resnet50_features.npz'
@@ -151,7 +153,7 @@ def draw_box(img, det):
 
 # ------------------------------------------------------------------ 3~5. ResNet 특징, 판별, Grad-CAM
 class Analyzer:
-    """ResNet-50 + 판별 랜덤포레스트(A만) + 설명용 로지스틱 회귀(A~D).
+    """ResNet-50 + 판별 랜덤포레스트(A~D) + 설명용 로지스틱 회귀(A~D).
     exclude_sample 이 있으면 그 시료를 빼고 학습 (데모 모드)"""
 
     def __init__(self, exclude_sample=None, seed=0):
@@ -169,22 +171,16 @@ class Analyzer:
 
         z = np.load(FEAT_CACHE)
         vec = {n: x for n, x in zip(z['names'], z['X'])}
-        XA, X4, y = [], [], []
+        X4, y = [], []
         for s, (chem, _) in SAMPLES.items():
             if s == exclude_sample:
                 continue
             for a in range(1, 21):
-                XA.append(vec[f'A{s}-{a}'])
                 X4.append(np.concatenate([vec[f'{c}{s}-{a}'] for c in CHANNELS]))
                 y.append(CLASSES.index(chem))
-        XA, X4, y = np.array(XA), np.array(X4), np.array(y)
-        self.rf = RandomForestClassifier(n_estimators=500, random_state=seed, n_jobs=-1).fit(XA, y)
-        # 참고용 두 번째 판별: A~D 4장을 모두 쓰는 랜덤포레스트 (교차검증 13개 중 평균 7.4개 정답)
-        #  → A 스팟이 없어 위 판별이 '고정값'이 될 때도 사진에 따라 달라지는 결과를 함께 보여 주려고
+        X4, y = np.array(X4), np.array(y)
+        # 판별: A~D 4장을 모두 쓰는 랜덤포레스트 (교차검증 13개 중 평균 7.4개 정답)
         self.rf4 = RandomForestClassifier(n_estimators=500, random_state=seed, n_jobs=-1).fit(X4, y)
-        # A 스팟이 없을 때 판별기가 내는 값 = 사진과 상관없이 늘 같은 값 (화면에서 경고용)
-        self.p_no_A = np.zeros(len(CLASSES))
-        self.p_no_A[self.rf.classes_] = self.rf.predict_proba(np.zeros((1, DIM)))[0]
         self._build_similarity(vec, exclude_sample)
         self.scaler = StandardScaler().fit(X4)
         self.logit = LogisticRegression(C=1.0, max_iter=5000).fit(self.scaler.transform(X4), y)
@@ -255,15 +251,13 @@ class Analyzer:
         return np.concatenate([[1.0], f]).astype(np.float32)
 
     def classify(self, feats):
-        """feats: {'A': 벡터, ...} → 판별 랜덤포레스트(A만) 확률, 설명용 판정층(A~D) 확률"""
-        p_rf = np.zeros(len(CLASSES))
-        p_rf[self.rf.classes_] = self.rf.predict_proba(feats['A'][None])[0]
+        """feats: {'A': 벡터, ...} → 판별 랜덤포레스트(A~D) 확률, 설명용 판정층(A~D) 확률"""
         x4 = np.concatenate([feats[c] for c in CHANNELS])[None]
         p_lr = np.zeros(len(CLASSES))
         p_lr[self.logit.classes_] = self.logit.predict_proba(self.scaler.transform(x4))[0]
         p_rf4 = np.zeros(len(CLASSES))
         p_rf4[self.rf4.classes_] = self.rf4.predict_proba(x4)[0]
-        return p_rf, p_lr, p_rf4
+        return p_rf4, p_lr
 
     def gradcam(self, crop, channel, class_idx, alpha=0.45):
         """잘라낸 스팟 위에 class_idx 쪽으로 판단을 끌어당긴 부분을 히트맵으로 겹침"""
@@ -288,20 +282,38 @@ def run_pipeline(images, conc_mg_L, analyzer, detectors, do_topview=True, conf=0
     """images: {'A': BGR, 'B': ..., 'C': ..., 'D': ...} → 단계별 결과 사전"""
     res = {'channels': {}}
     feats = {}
+    # do_topview: True(변환) / False(그대로) / 'auto'(둘 다 해 보고 스팟을 더 잘 찾는 쪽)
+    #  이미 탑뷰인 사진을 한 번 더 변환하면 세로로 길게 늘어나 스팟을 못 찾게 됨 → 자동 판단이 기본
+    cand = {}
+    modes = [True, False] if do_topview == 'auto' else [bool(do_topview)]
+    for m in modes:
+        cand[m] = {}
+        for ch in CHANNELS:
+            tv, how = (topview(images[ch], camera_angle_deg, hfov_deg) if m
+                       else (images[ch], '변환 생략 (이미 탑뷰)'))
+            cand[m][ch] = (tv, how, detect(tv, detectors, conf=conf))
+    # 4장에서 '스팟 있음'에 동의한 모델 수 합계 → 큰 쪽 선택 (같으면 평균 확신도로)
+    score = {m: (sum(d['votes'] for _, _, d in cand[m].values()),
+                 sum(d['conf'] or 0 for _, _, d in cand[m].values())) for m in modes}
+    chosen = max(modes, key=lambda m: score[m])
+    res['topview_used'] = chosen
+    if do_topview == 'auto':
+        res['topview_auto'] = {('탑뷰 변환' if m else '변환 안 함'): score[m][0] for m in modes}
     for ch in CHANNELS:
-        img = images[ch]
-        tv, how = topview(img, camera_angle_deg, hfov_deg) if do_topview else (img, '변환 생략 (이미 탑뷰)')
-        det = detect(tv, detectors, conf=conf)
+        tv, how, det = cand[chosen][ch]
+        if do_topview == 'auto':
+            how = f'자동 판단 → {how}'
         crop = crop_spot(tv, det['box']) if det['detected'] else None
         hand = spot_features(tv, det['box']) if det['detected'] else None
         feats[ch] = analyzer.feature(crop)
         res['channels'][ch] = {'topview': tv, 'topview_how': how, 'det': det, 'boxed': draw_box(tv, det),
                                'crop': crop, 'features': hand}
-    p_rf, p_lr, p_rf4 = analyzer.classify(feats)
-    pred = int(p_rf.argmax())
-    res['proba'], res['proba_explainer'], res['proba_4ch'] = p_rf, p_lr, p_rf4
-    res['a_missing'] = not res['channels']['A']['det']['detected']  # True 면 res['proba'] 는 고정값
-    res['proba_no_A'] = analyzer.p_no_A
+    p_rf4, p_lr = analyzer.classify(feats)
+    # 최종 판별 = A~D 4장을 모두 보는 랜덤포레스트 (LOSO 5개 시드 평균 7.4/13)
+    #  4종(증류수·Cu·NaCl·SDS) 중 하나로 답함. 증류수(대조군)면 TU = 0
+    res['a_missing'] = not res['channels']['A']['det']['detected']
+    pred = int(p_rf4.argmax())
+    res['proba'], res['proba_explainer'] = p_rf4, p_lr
     res['similarity'] = analyzer.similarity(feats)
     res['pred'] = CLASSES[pred]
     res['tu'] = assess(CLASSES[pred], conc_mg_L)

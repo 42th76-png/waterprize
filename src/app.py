@@ -20,7 +20,8 @@ import pipeline as P  # noqa: E402
 st.set_page_config(page_title='커피링 생태독성 스크리닝', page_icon='💧', layout='wide')
 
 GRADE_COLOR = {'저': '#0ca30c', '중': '#c98500', '고': '#d03b3b'}
-CLASS_KO = {'Ctrl': '대조군(독성 물질 없음)', 'Cu': '구리(Cu)', 'NaCl': '염화나트륨(NaCl)', 'SDS': '계면활성제(SDS)'}
+CLASS_KO = {'Ctrl': '증류수(독성 물질 없음)', 'Cu': '구리(Cu)', 'NaCl': '염화나트륨(NaCl)', 'SDS': '계면활성제(SDS)'}
+CLASS_SHORT = {'Ctrl': '증류수', 'Cu': 'Cu', 'NaCl': 'NaCl', 'SDS': 'SDS'}
 
 
 def rgb(img):
@@ -46,8 +47,11 @@ st.caption('⚠️ KJWP 2026 고등학생 연구용 시연입니다. 시료 13�
 # ---------------------------------------------------------------- 옆 메뉴: 설정
 with st.sidebar:
     st.header('설정')
-    mode = st.radio('올리는 사진 종류', ['원본 촬영 사진 (57°) → 탑뷰 변환', '이미 탑뷰로 변환된 사진 (데이터셋 사진 등)'])
-    do_topview = mode.startswith('원본')
+    mode = st.radio('올리는 사진 종류', ['자동 판단 (추천)', '원본 촬영 사진 (57°) → 탑뷰 변환',
+                                       '이미 탑뷰로 변환된 사진 (데이터셋 사진 등)'],
+                    help='자동 판단: 탑뷰 변환을 한 것과 안 한 것 둘 다 스팟을 찾아 보고, 더 잘 찾는 쪽을 씁니다. '
+                         '이미 탑뷰인 사진을 또 변환하면 사진이 늘어나 스팟을 못 찾게 됩니다.')
+    do_topview = 'auto' if mode.startswith('자동') else mode.startswith('원본')
     angle, fov = 57.0, 70.0
     if do_topview and not (P.SRC / 'topview_convert.py').exists():
         st.info('src/topview_convert.py 가 없어 촬영 각도로 근사 변환합니다. '
@@ -60,8 +64,8 @@ with st.sidebar:
     st.divider()
     st.markdown('**사용하는 모델** (앞 단계 결정 그대로)\n'
                 '- 스팟 탐지: LOSO fold 모델 13개의 과반수 투표\n'
-                '- 판별: ResNet-50 특징 + 랜덤포레스트, 스팟 A만 (교차검증 13개 중 8개 정답)\n'
-                '- 참고 판별: 같은 방식, 스팟 A~D (교차검증 평균 7.4개)\n'
+                '- 판별: ResNet-50 특징 + 랜덤포레스트, 스팟 A~D 4장 '
+                '(증류수·Cu·NaCl·SDS 중 하나, 교차검증 13개 중 평균 7.4개 정답)\n'
                 '- 닮은 정도: 학습 사진과의 코사인 유사도 (처음 보는 패턴 경고)\n'
                 '- Grad-CAM: 설명용 로지스틱 회귀 판정층 (A~D)\n'
                 '- TU: 문헌 EC50 (Cu 0.521, NaCl 4,770, SDS 5.5 mg/L)')
@@ -132,11 +136,13 @@ if res and st.session_state['res_meta'].get('sig') != input_sig:
 if res:
     meta = st.session_state['res_meta']
     if meta['demo']:
-        st.success(f"데모 모드: 시료 {meta['known']} 을 뺀 모델로 분석했습니다 (정답: {P.SAMPLES[meta['known']][0]}).")
+        st.success(f"데모 모드: 시료 {meta['known']} 을 뺀 모델로 분석했습니다 (정답: {CLASS_SHORT[P.SAMPLES[meta['known']][0]]}).")
 
     # ② 탑뷰 + ③ 스팟 탐지
     st.subheader('② 탑뷰 변환 → ③ 스팟 탐지')
-    st.caption(f"탑뷰: {res['channels']['A']['topview_how']}")
+    auto = res.get('topview_auto')
+    st.caption(f"탑뷰: {res['channels']['A']['topview_how']}"
+               + (' (스팟을 찾은 모델 수 합계: ' + ', '.join(f'{k} {v}' for k, v in auto.items()) + ')' if auto else ''))
     cols = st.columns(4)
     for col, ch in zip(cols, P.CHANNELS):
         c = res['channels'][ch]
@@ -168,23 +174,14 @@ if res:
         st.markdown(f"### {CLASS_KO[res['pred']]}")
         for k, cls in enumerate(P.CLASSES):
             st.progress(float(res['proba'][k]), text=f'{CLASS_KO[cls]}: {res["proba"][k]:.2f}')
-        st.caption('판별에는 A(증류수) 스팟만 사용합니다 (교차검증에서 가장 좋았던 방식, 13개 중 8개 정답). '
-                   '대조군 시료가 1개뿐이라 대조군 판별은 특히 믿기 어렵습니다.')
-        if res.get('a_missing'):
-            st.warning('**A(증류수) 스팟을 찾지 못했습니다.** 이때 판별기는 사진 내용을 보지 않고 '
-                       "'A 스팟이 없던 학습 시료들'의 비율만으로 답하므로, 어떤 사진을 넣어도 항상 같은 값 "
-                       f"({' / '.join(f'{c} {v:.2f}' for c, v in zip(P.CLASSES, res['proba_no_A']))})이 나옵니다. "
-                       '학습 데이터에서 A 스팟이 없던 시료는 주로 Cu 였기 때문에 Cu 쪽으로 치우칩니다. '
-                       '아래 A~D 4장 판별을 함께 보세요.')
-        # 참고: A~D 4장 모두 쓰는 판별 (사진마다 달라짐)
-        p4 = res.get('proba_4ch')
-        if p4 is not None:
-            with st.expander(f"참고: A~D 4장을 모두 쓴 판별 → {CLASS_KO[P.CLASSES[int(p4.argmax())]]}",
-                             expanded=bool(res.get('a_missing'))):
-                for k, cls in enumerate(P.CLASSES):
-                    st.progress(float(p4[k]), text=f'{CLASS_KO[cls]}: {p4[k]:.2f}')
-                st.caption('교차검증 13개 중 평균 7.4개 정답 (A만 쓰는 위 판별보다 조금 낮음). '
-                           '두 판별이 같은 답이면 조금 더 믿을 만하고, 다르면 결과를 조심해서 보세요.')
+        # 증류수 확률이 1위와 0.1 이내로 가까우면 안내 (증류수 학습 시료가 1개뿐이라 확률이 낮게 나오기 쉬움)
+        p_ctrl, p_top = float(res['proba'][0]), float(res['proba'].max())
+        if res['pred'] != 'Ctrl' and p_top - p_ctrl <= 0.10:
+            st.info(f"**증류수일 가능성도 있습니다.** 증류수 확률({p_ctrl:.2f})이 1위({p_top:.2f})와 거의 같습니다. "
+                    '증류수와 저농도 Cu 는 건조 패턴이 비슷해 구분이 어렵습니다.')
+        st.caption('A~D 4장(증류수 · 탄닌 · 셀룰로오스 · 탄닌+셀룰로오스 채널)의 스팟을 모두 보고 판별합니다 '
+                   '(교차검증 13개 시료 중 평균 7.4개 정답). 스팟이 없는 채널은 "커피링 미관찰"로 판단에 반영됩니다. '
+                   '증류수(독성 물질 없음) 학습 시료가 1개뿐이라 증류수 판별은 특히 믿기 어렵습니다.')
 
         # 학습 시료와 얼마나 닮았나: 모델은 4종 중 하나로만 답할 수 있으므로, 처음 보는 물질도 억지로 4종 중 하나가 됨
         sim = res.get('similarity')
@@ -198,7 +195,7 @@ if res:
             if sim['unfamiliar']:
                 st.error(f"**처음 보는 패턴입니다** ({', '.join(sim['odd_channels'])} 채널). "
                          '이 채널 사진은 학습한 13개 시료 어느 것과도 기준선보다 덜 닮았습니다. '
-                         '모델은 Ctrl·Cu·NaCl·SDS 네 가지 중 하나로만 답하도록 만들어졌기 때문에, '
+                         '모델은 증류수·Cu·NaCl·SDS 네 가지 중 하나로만 답하도록 만들어졌기 때문에, '
                          '학습하지 않은 물질이거나 촬영 조건(거리·각도·조명·배경)이 다르면 위 판별 결과는 믿기 어렵습니다.')
         elif sim is not None:
             st.error('**4장 모두에서 스팟을 찾지 못했습니다.** 판별 결과는 사진과 상관없는 고정값이니 쓰지 마세요. '
@@ -210,16 +207,16 @@ if res:
         st.markdown(f"<div style='font-size:3rem;font-weight:700;color:{color}'>{tu['grade']}</div>",
                     unsafe_allow_html=True)
         st.metric('TU (농도 ÷ EC50)', f"{tu['tu']:.3g}")
-        ec50 = f"{tu['ec50_mg_L']:g} mg/L" if tu['ec50_mg_L'] else '없음 (대조군 TU = 0)'
-        st.caption(f"판별 결과 {res['pred']} · 입력 농도 {tu['conc_mg_L']:g} mg/L · EC50 {ec50}\n\n"
+        ec50 = f"{tu['ec50_mg_L']:g} mg/L" if tu['ec50_mg_L'] else '없음 (증류수는 독성 물질이 없어 TU = 0)'
+        st.caption(f"A~D 4장 판별 결과 {CLASS_SHORT[res['pred']]} · 입력 농도 {tu['conc_mg_L']:g} mg/L · EC50 {ec50}\n\n"
                    '등급: 저 TU < 1 / 중 1~10 / 고 ≥ 10. 판별이 틀리면 TU 도 틀립니다 '
                    '(특히 Cu 로 잘못 판별하면 EC50 이 작아 TU 가 크게 부풀려짐).')
 
     # ⑥ Grad-CAM
     st.subheader('⑥ Grad-CAM: 어느 부분을 보고 판단했나')
     pe = res['proba_explainer']
-    st.caption(f"빨간색일수록 판별 결과({res['pred']}) 쪽으로 판단을 끌어당긴 부분입니다. "
-               f"설명용 판정층(A~D)의 자체 예측: {P.CLASSES[int(pe.argmax())]} ({pe.max():.2f}). "
+    st.caption(f"빨간색일수록 판별 결과({CLASS_SHORT[res['pred']]}) 쪽으로 판단을 끌어당긴 부분입니다. "
+               f"설명용 판정층(A~D)의 자체 예측: {CLASS_SHORT[P.CLASSES[int(pe.argmax())]]} ({pe.max():.2f}). "
                '히트맵이 스팟이 아닌 배경에 몰려 있으면, 패턴보다 배경·밝기에 끌린 판단일 수 있습니다.')
     cols = st.columns(4)
     for col, ch in zip(cols, P.CHANNELS):
