@@ -34,7 +34,8 @@ def read(path):
 
 
 @st.cache_resource(show_spinner='모델 불러오는 중 (처음 한 번만, 1분 정도)...')
-def get_models(exclude_sample):
+def get_models(exclude_sample, version):
+    """version(P.VERSION)이 바뀌면 저장해 둔 예전 모델을 버리고 새로 만듦"""
     return P.Analyzer(exclude_sample=exclude_sample), P.load_detectors(exclude_sample)
 
 
@@ -113,7 +114,7 @@ if not ready:
     st.info('A~D 사진 4장을 모두 올리거나, 예시 사진을 고르면 분석을 시작할 수 있습니다.')
 if st.button('분석 시작', type='primary', disabled=not ready):
     exclude = known if demo else None
-    analyzer, detectors = get_models(exclude)
+    analyzer, detectors = get_models(exclude, P.VERSION)
     if example:  # 예시 사진은 이미 탑뷰라 변환하지 않음
         images = {ch: read(EXAMPLES / f'{ch}{example}-1.jpg') for ch in P.CHANNELS}
         use_topview = False

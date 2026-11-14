@@ -30,6 +30,9 @@ if str(SRC) not in sys.path:
 from extract_features import spot_features  # noqa: E402  (특징량 4가지: 앞 단계와 같은 계산)
 from toxic_unit import SAMPLES, assess  # noqa: E402
 
+# 분석 코드 버전: 화면(app.py)은 불러온 모델을 메모리에 저장해 두고 다시 씀(st.cache_resource).
+# Analyzer 등 코드를 바꾸면 이 값을 바꿔야 예전 모델 대신 새 모델을 만듦 (안 바꾸면 예전 객체와 새 코드가 섞여 오류)
+VERSION = '2026-11-14-abcd'
 CLASSES = ['Ctrl', 'Cu', 'NaCl', 'SDS']
 CHANNELS = 'ABCD'
 CHANNEL_NAME = {'A': '증류수', 'B': '탄닌', 'C': '셀룰로오스', 'D': '탄닌+셀룰로오스'}
